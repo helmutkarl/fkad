@@ -21,24 +21,35 @@ if (-not $NoExec -and -not (Test-Path -LiteralPath $ProbeExecutable -PathType Le
     throw "Probe executable not found: $ProbeExecutable"
 }
 
-$currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-$currentAccount  = $currentIdentity.Name
-$currentSid      = $currentIdentity.User
+$currentIdentity  = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$currentPrincipal = New-Object System.Security.Principal.WindowsPrincipal($currentIdentity)
+$currentAccount   = $currentIdentity.Name
+$currentSid       = $currentIdentity.User
 
-# Build a SID set for the current logon token once. This avoids account-name
-# translation for every ACE in every directory.
-$tokenSids = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-[void]$tokenSids.Add($currentSid.Value)
+# Access-check approximation:
+# - allowSids contains only groups which are actually enabled for role membership.
+#   WindowsPrincipal.IsInRole() uses token membership semantics and therefore does
+#   not treat DENY_ONLY groups as usable for ALLOW ACEs.
+# - denySids contains all token groups, because DENY_ONLY groups still participate
+#   in DENY ACE evaluation.
+$allowSids = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+$denySids  = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+[void]$allowSids.Add($currentSid.Value)
+[void]$denySids.Add($currentSid.Value)
 
 foreach ($sid in $currentIdentity.Groups) {
-    if ($null -ne $sid) {
-        [void]$tokenSids.Add($sid.Value)
-    }
-}
+    if ($null -eq $sid) { continue }
 
-# Common token SIDs which may not always appear in WindowsIdentity.Groups.
-[void]$tokenSids.Add('S-1-1-0')   # Everyone
-[void]$tokenSids.Add('S-1-5-11')  # Authenticated Users
+    [void]$denySids.Add($sid.Value)
+
+    try {
+        if ($currentPrincipal.IsInRole($sid)) {
+            [void]$allowSids.Add($sid.Value)
+        }
+    }
+    catch {}
+}
 
 $probeHash = $null
 if (-not $NoExec) {
@@ -110,7 +121,6 @@ function Invoke-DirectoryProbe {
 
                     $process = [System.Diagnostics.Process]::Start($psi)
                     if ($null -ne $process) {
-                        # Successful process creation proves execution from the path.
                         $execute = $true
 
                         if (-not $process.WaitForExit($ExecTimeoutMs)) {
@@ -156,12 +166,15 @@ function Get-EffectiveControlRights {
 
     $canWriteDac   = $false
     $canWriteOwner = $false
+    $writeDacSource   = $null
+    $writeOwnerSource = $null
 
-    # An object's owner has the implicit right to change its DACL.
+    # The object owner has the implicit ability to alter the DACL.
     try {
         $ownerSid = $Acl.GetOwner([System.Security.Principal.SecurityIdentifier])
         if ($null -ne $ownerSid -and $ownerSid.Value -eq $currentSid.Value) {
             $canWriteDac = $true
+            $writeDacSource = "OBJECT_OWNER:$($ownerSid.Value)"
         }
     }
     catch {}
@@ -173,10 +186,6 @@ function Get-EffectiveControlRights {
             [System.Security.Principal.SecurityIdentifier]
         )
 
-        # AccessCheck semantics for a single requested right are simple here:
-        # walk the canonical DACL in order. The first matching deny/allow that
-        # covers that still-unresolved right decides it. Inherit-only ACEs do
-        # not apply to the directory object itself.
         $writeDacResolved   = $canWriteDac
         $writeOwnerResolved = $false
 
@@ -186,20 +195,24 @@ function Get-EffectiveControlRights {
             }
 
             $sid = $rule.IdentityReference.Value
-            if (-not $tokenSids.Contains($sid)) {
-                continue
-            }
-
             $rights = [System.Security.AccessControl.FileSystemRights]$rule.FileSystemRights
+            $isAllow = ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow)
+            $isDeny  = ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny)
+
+            # DENY_ONLY groups are intentionally eligible only here, not for ALLOW.
+            $sidApplies = if ($isAllow) { $allowSids.Contains($sid) } else { $denySids.Contains($sid) }
+            if (-not $sidApplies) { continue }
 
             if (-not $writeDacResolved -and ($rights -band [System.Security.AccessControl.FileSystemRights]::ChangePermissions)) {
                 $writeDacResolved = $true
-                $canWriteDac = ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow)
+                $canWriteDac = $isAllow
+                $writeDacSource = "$(if ($isAllow) {'ALLOW'} else {'DENY'}):$sid"
             }
 
             if (-not $writeOwnerResolved -and ($rights -band [System.Security.AccessControl.FileSystemRights]::TakeOwnership)) {
                 $writeOwnerResolved = $true
-                $canWriteOwner = ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow)
+                $canWriteOwner = $isAllow
+                $writeOwnerSource = "$(if ($isAllow) {'ALLOW'} else {'DENY'}):$sid"
             }
 
             if ($writeDacResolved -and $writeOwnerResolved) {
@@ -210,57 +223,44 @@ function Get-EffectiveControlRights {
     catch {}
 
     return [PSCustomObject]@{
-        WriteDac   = $canWriteDac
-        WriteOwner = $canWriteOwner
+        WriteDac        = $canWriteDac
+        WriteOwner      = $canWriteOwner
+        WriteDacSource  = $writeDacSource
+        WriteOwnerSource = $writeOwnerSource
     }
 }
 
-function Grant-CurrentUserModifyFast {
+function Grant-CurrentUserModify {
     param (
         [Parameter(Mandatory = $true)]
-        [string]$Path,
-
-        [Parameter(Mandatory = $true)]
-        [System.Security.AccessControl.DirectorySecurity]$Acl
+        [string]$Path
     )
 
-    try {
-        # This ACE applies to the directory itself. It intentionally does not
-        # rewrite existing child ACLs. The change is persistent.
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $currentSid,
-            [System.Security.AccessControl.FileSystemRights]::Modify,
-            [System.Security.AccessControl.InheritanceFlags]::None,
-            [System.Security.AccessControl.PropagationFlags]::None,
-            [System.Security.AccessControl.AccessControlType]::Allow
-        )
+    # Only called for pre-filtered WRITE_DAC candidates, so spawning icacls here
+    # is cheap. Unlike Set-Acl, icacls /grant changes the DACL specifically and
+    # gives us a useful native error if Windows rejects the mutation.
+    $grant = "${currentAccount}:(M)"
+    $output = & icacls.exe $Path /grant $grant /Q 2>&1
+    $exitCode = $LASTEXITCODE
 
-        [void]$Acl.AddAccessRule($rule)
-        Set-Acl -LiteralPath $Path -AclObject $Acl -ErrorAction Stop
-
-        return [PSCustomObject]@{ Success = $true; Detail = $null }
-    }
-    catch {
-        return [PSCustomObject]@{ Success = $false; Detail = $_.Exception.Message }
+    return [PSCustomObject]@{
+        Success = ($exitCode -eq 0)
+        Detail  = (($output | Out-String).Trim())
     }
 }
 
-function Set-CurrentUserOwnerFast {
+function Set-CurrentUserOwner {
     param (
         [Parameter(Mandatory = $true)]
-        [string]$Path,
-
-        [Parameter(Mandatory = $true)]
-        [System.Security.AccessControl.DirectorySecurity]$Acl
+        [string]$Path
     )
 
-    try {
-        $Acl.SetOwner($currentSid)
-        Set-Acl -LiteralPath $Path -AclObject $Acl -ErrorAction Stop
-        return [PSCustomObject]@{ Success = $true; Detail = $null }
-    }
-    catch {
-        return [PSCustomObject]@{ Success = $false; Detail = $_.Exception.Message }
+    $output = & icacls.exe $Path /setowner $currentAccount /Q 2>&1
+    $exitCode = $LASTEXITCODE
+
+    return [PSCustomObject]@{
+        Success = ($exitCode -eq 0)
+        Detail  = (($output | Out-String).Trim())
     }
 }
 
@@ -280,7 +280,7 @@ if ($NoAclEscalation) {
     Write-Host "ACL probing : disabled"
 }
 else {
-    Write-Host "ACL probing : token-filtered; successful changes are PERSISTENT" -ForegroundColor Yellow
+    Write-Host "ACL probing : token-filtered + practical mutation; successful changes are PERSISTENT" -ForegroundColor Yellow
 }
 
 Write-Host ""
@@ -312,24 +312,28 @@ Write-Host ""
 $results = New-Object 'System.Collections.Generic.List[object]'
 $processed = 0
 $aclCandidates = 0
+$aclRejected = 0
 
 foreach ($folder in $folders) {
     $processed++
     $path = $folder.FullName
 
-    # Fast path: practical write/exec probe first. No Get-Acl call is needed
-    # for already writable paths.
+    # Fast path first. Already-writable directories do not need ACL parsing.
     $initialProbe = Invoke-DirectoryProbe -Path $path
 
     $candidateWriteDac   = $false
     $candidateWriteOwner = $false
-    $aclGrantAttempted   = $false
-    $aclGrantSucceeded   = $false
-    $aclGrantError       = $null
+    $writeDacSource      = $null
+    $writeOwnerSource    = $null
+
+    $aclGrantAttempted    = $false
+    $aclGrantSucceeded    = $false
+    $aclGrantError        = $null
     $ownerChangeAttempted = $false
     $ownerChangeSucceeded = $false
     $ownerChangeError     = $null
     $escalationMethod     = $null
+    $aclOutcome           = $null
     $finalProbe           = $initialProbe
 
     $originalOwner = $null
@@ -337,7 +341,6 @@ foreach ($folder in $folders) {
     $finalOwner    = $null
     $finalSddl     = $null
 
-    # Slow path only for non-writable directories.
     if (-not $initialProbe.Writable -and -not $NoAclEscalation) {
         $acl = $null
 
@@ -352,55 +355,70 @@ foreach ($folder in $folders) {
             $control = Get-EffectiveControlRights -Acl $acl
             $candidateWriteDac   = $control.WriteDac
             $candidateWriteOwner = $control.WriteOwner
+            $writeDacSource      = $control.WriteDacSource
+            $writeOwnerSource    = $control.WriteOwnerSource
 
             if ($candidateWriteDac -or $candidateWriteOwner) {
                 $aclCandidates++
+                Write-Host "[ACL CANDIDATE] $path  WDAC=$candidateWriteDac WO=$candidateWriteOwner" -ForegroundColor DarkMagenta
+
+                if ($candidateWriteDac) {
+                    Write-Host "                WRITE_DAC source: $writeDacSource" -ForegroundColor DarkGray
+                }
+                if ($candidateWriteOwner) {
+                    Write-Host "                WRITE_OWNER source: $writeOwnerSource" -ForegroundColor DarkGray
+                }
             }
 
-            # Only attempt a persistent DACL mutation if the current token's
-            # ACEs/ownership indicate that ChangePermissions is actually usable.
             if ($candidateWriteDac) {
                 $aclGrantAttempted = $true
-                $grantResult = Grant-CurrentUserModifyFast -Path $path -Acl $acl
+                $grantResult = Grant-CurrentUserModify -Path $path
 
                 if ($grantResult.Success) {
                     $aclGrantSucceeded = $true
                     $escalationMethod = 'DACL'
+                    $aclOutcome = 'DACL mutation succeeded'
+                    Write-Host "[ACL APPLIED]   $path  granted Modify to $currentAccount" -ForegroundColor Magenta
                 }
                 else {
                     $aclGrantError = $grantResult.Detail
+                    $aclOutcome = 'DACL candidate rejected by practical mutation'
+                    $aclRejected++
+                    Write-Host "[ACL REJECTED]  $path  DACL change failed: $aclGrantError" -ForegroundColor DarkYellow
                 }
             }
 
-            # If direct DACL control was unavailable or failed, test WRITE_OWNER.
             if (-not $aclGrantSucceeded -and $candidateWriteOwner) {
                 $ownerChangeAttempted = $true
-                $ownerResult = Set-CurrentUserOwnerFast -Path $path -Acl $acl
+                $ownerResult = Set-CurrentUserOwner -Path $path
 
                 if ($ownerResult.Success) {
                     $ownerChangeSucceeded = $true
                     $escalationMethod = 'OWNER'
+                    Write-Host "[OWNER APPLIED] $path  owner changed to $currentAccount" -ForegroundColor Magenta
 
-                    # Re-read after ownership change; the owner can then alter the DACL.
-                    try {
-                        $ownedAcl = Get-Acl -LiteralPath $path -ErrorAction Stop
-                        $aclGrantAttempted = $true
-                        $grantAfterOwner = Grant-CurrentUserModifyFast -Path $path -Acl $ownedAcl
+                    $aclGrantAttempted = $true
+                    $grantAfterOwner = Grant-CurrentUserModify -Path $path
 
-                        if ($grantAfterOwner.Success) {
-                            $aclGrantSucceeded = $true
-                            $escalationMethod = 'OWNER+DACL'
-                        }
-                        else {
-                            $aclGrantError = $grantAfterOwner.Detail
-                        }
+                    if ($grantAfterOwner.Success) {
+                        $aclGrantSucceeded = $true
+                        $escalationMethod = 'OWNER+DACL'
+                        $aclOutcome = 'Owner mutation succeeded; DACL mutation succeeded'
+                        Write-Host "[ACL APPLIED]   $path  granted Modify after owner change" -ForegroundColor Magenta
                     }
-                    catch {
-                        $aclGrantError = $_.Exception.Message
+                    else {
+                        $aclGrantError = $grantAfterOwner.Detail
+                        $aclOutcome = 'Owner mutation succeeded; DACL mutation failed'
+                        Write-Host "[ACL REJECTED]  $path  owner changed, but Modify grant failed: $aclGrantError" -ForegroundColor DarkYellow
                     }
                 }
                 else {
                     $ownerChangeError = $ownerResult.Detail
+                    if (-not $aclOutcome) {
+                        $aclOutcome = 'WRITE_OWNER candidate rejected by practical mutation'
+                        $aclRejected++
+                    }
+                    Write-Host "[OWNER REJECTED] $path  owner change failed: $ownerChangeError" -ForegroundColor DarkYellow
                 }
             }
 
@@ -413,6 +431,13 @@ foreach ($folder in $folders) {
                     $finalSddl  = $finalAcl.Sddl
                 }
                 catch {}
+
+                if ($finalProbe.Writable) {
+                    Write-Host "[ACL VERIFIED]  $path  write succeeded after ACL/owner mutation" -ForegroundColor Green
+                }
+                else {
+                    Write-Host "[ACL UNVERIFIED] $path  mutation succeeded but write still failed: $($finalProbe.WriteError)" -ForegroundColor DarkYellow
+                }
             }
         }
     }
@@ -439,12 +464,16 @@ foreach ($folder in $folders) {
         InitiallyExecutable     = $initialProbe.Executable
 
         CandidateWriteDac       = $candidateWriteDac
+        WriteDacSource          = $writeDacSource
         CandidateWriteOwner     = $candidateWriteOwner
+        WriteOwnerSource        = $writeOwnerSource
+
         AclGrantAttempted       = $aclGrantAttempted
         AclGrantSucceeded       = $aclGrantSucceeded
         OwnerChangeAttempted    = $ownerChangeAttempted
         OwnerChangeSucceeded    = $ownerChangeSucceeded
         EscalationMethod        = $escalationMethod
+        AclOutcome              = $aclOutcome
 
         Writable                = $finalProbe.Writable
         Readable                = $finalProbe.Readable
@@ -473,16 +502,13 @@ foreach ($folder in $folders) {
     elseif (-not $initialProbe.Writable -and $aclGrantSucceeded -and $finalProbe.Writable) {
         Write-Host "[$escalationMethod -> WRITE ONLY]   $path" -ForegroundColor Magenta
     }
-    elseif ($candidateWriteDac -or $candidateWriteOwner) {
-        Write-Host "[ACL CONTROL]  $path  WDAC=$candidateWriteDac WO=$candidateWriteOwner" -ForegroundColor Magenta
-    }
-    elseif ($finalProbe.Executable) {
+    elseif ($initialProbe.Executable) {
         Write-Host "[WRITE + EXEC] $path" -ForegroundColor Red
     }
-    elseif ($finalProbe.ProbeCopied) {
+    elseif ($initialProbe.ProbeCopied) {
         Write-Host "[WRITE ONLY]   $path" -ForegroundColor Yellow
     }
-    else {
+    elseif ($initialProbe.Writable) {
         Write-Host "[WRITABLE]     $path" -ForegroundColor DarkYellow
     }
 }
@@ -492,16 +518,23 @@ $results |
 
 Write-Host ""
 Write-Host "Finished." -ForegroundColor Cyan
-Write-Host "Scanned                  : $($folders.Count)"
-Write-Host "ACL-control candidates   : $aclCandidates"
-Write-Host "Initially writable       : $(($results | Where-Object InitiallyWritable).Count)"
-Write-Host "DACL grant succeeded     : $(($results | Where-Object AclGrantSucceeded).Count)"
-Write-Host "Owner change succeeded   : $(($results | Where-Object OwnerChangeSucceeded).Count)"
-Write-Host "Final writable           : $(($results | Where-Object Writable).Count)"
-Write-Host "Final writable+executable: $(($results | Where-Object Executable).Count)"
-Write-Host "Results                   : $CsvPath"
+Write-Host "Scanned                    : $($folders.Count)"
+Write-Host "ACL-control candidates     : $aclCandidates"
+Write-Host "ACL candidates rejected    : $aclRejected"
+Write-Host "Initially writable         : $(($results | Where-Object InitiallyWritable).Count)"
+Write-Host "DACL grant succeeded       : $(($results | Where-Object AclGrantSucceeded).Count)"
+Write-Host "Owner change succeeded     : $(($results | Where-Object OwnerChangeSucceeded).Count)"
+Write-Host "Final writable             : $(($results | Where-Object Writable).Count)"
+Write-Host "Final writable+executable  : $(($results | Where-Object Executable).Count)"
+Write-Host "Results                     : $CsvPath"
 
 if (-not $NoAclEscalation) {
+    Write-Host ""
+    Write-Host "Legend:" -ForegroundColor Cyan
+    Write-Host "  ACL CANDIDATE = ACL/token analysis suggests WRITE_DAC/WRITE_OWNER; NOT proof." -ForegroundColor DarkGray
+    Write-Host "  ACL APPLIED   = Windows accepted the persistent permission/owner change." -ForegroundColor DarkGray
+    Write-Host "  ACL VERIFIED  = write probe succeeded after that change; practical proof." -ForegroundColor DarkGray
+    Write-Host "  ACL REJECTED  = pre-filter looked interesting, but Windows rejected mutation." -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "Successful ACL/owner changes were NOT reverted." -ForegroundColor Yellow
     Write-Host "Original Owner and SDDL are stored in the CSV for evidence/manual rollback." -ForegroundColor Yellow
